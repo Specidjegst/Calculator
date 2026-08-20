@@ -47,6 +47,17 @@ PRODUCTS = [
 ]
 PROD_BY_ID = {p[0]: p for p in PRODUCTS}
 
+# Startbestand in Gramm (Stueck x g) — wird nur beim ersten Anlegen gesetzt,
+# spaetere Aenderungen im Tool bleiben erhalten.
+START_STOCK = {
+    "p11": 217,  # Mega Cherry Gelato   31 x 7g
+    "p10": 252,  # Lemon Cherry Gelato  36 x 7g
+    "p12": 210,  # OG Kush              30 x 7g
+    "p9": 470,   # La Banana            47 x 10g
+    "p3": 100,   # Sour Diesel          10 x 10g
+    "p4": 50,    # Lemon x Cereal Milk   5 x 10g
+}
+
 
 # ------------------------------------------------------------------ DB
 def db():
@@ -75,9 +86,18 @@ def init_db():
             created_at INTEGER NOT NULL
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS cash_adjustments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount INTEGER NOT NULL,
+            note TEXT,
+            created_at INTEGER NOT NULL
+        )"""
+    )
     for pid, _, _ in PRODUCTS:
         conn.execute(
-            "INSERT OR IGNORE INTO inventory (product_id, grams) VALUES (?, 0)", (pid,)
+            "INSERT OR IGNORE INTO inventory (product_id, grams) VALUES (?, ?)",
+            (pid, START_STOCK.get(pid, 0)),
         )
     conn.commit()
     conn.close()
@@ -134,19 +154,73 @@ def get_by_day(limit=14):
     return rows
 
 
-def get_by_week(limit=8):
+def get_by_month(limit=6):
     conn = db()
     rows = [dict(r) for r in conn.execute(
-        """SELECT strftime('%Y', sale_date) y,
-                  strftime('%W', sale_date) w,
+        """SELECT strftime('%Y-%m', sale_date) ym,
                   COALESCE(SUM(price),0) rev,
                   COALESCE(SUM(grams),0) g,
                   COUNT(*) c
-           FROM sales GROUP BY y, w ORDER BY y DESC, w DESC LIMIT ?""",
+           FROM sales GROUP BY ym ORDER BY ym DESC LIMIT ?""",
         (limit,),
     )]
     conn.close()
     return rows
+
+
+def get_adjustments():
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM cash_adjustments ORDER BY id DESC"
+    )]
+    total = conn.execute(
+        "SELECT COALESCE(SUM(amount),0) s FROM cash_adjustments"
+    ).fetchone()[0]
+    conn.close()
+    return rows, total
+
+
+def add_adjustment(amount, note):
+    conn = db()
+    conn.execute(
+        "INSERT INTO cash_adjustments (amount, note, created_at) VALUES (?,?,?)",
+        (amount, note, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_adjustment(adj_id):
+    conn = db()
+    conn.execute("DELETE FROM cash_adjustments WHERE id=?", (adj_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_by_week(limit=8):
+    """Aggregiert pro Kalenderwoche (Montag-Sonntag), in Python berechnet."""
+    conn = db()
+    days = [dict(r) for r in conn.execute(
+        """SELECT sale_date,
+                  COALESCE(SUM(price),0) rev,
+                  COALESCE(SUM(grams),0) g,
+                  COUNT(*) c
+           FROM sales GROUP BY sale_date"""
+    )]
+    conn.close()
+    acc = {}
+    for d in days:
+        try:
+            dt = datetime.strptime(d["sale_date"], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        monday = dt - timedelta(days=dt.weekday())
+        a = acc.setdefault(monday, {"monday": monday, "rev": 0, "g": 0, "c": 0})
+        a["rev"] += d["rev"]
+        a["g"] += d["g"]
+        a["c"] += d["c"]
+    weeks = sorted(acc.values(), key=lambda x: x["monday"], reverse=True)[:limit]
+    return weeks
 
 
 def add_sale(customer, pid, grams, price, sale_date):
@@ -335,14 +409,21 @@ def dashboard(flash=""):
 
     flash_html = f"<div class='flash'>{html.escape(flash)}</div>" if flash else ""
 
+    adjustments, adj_total = get_adjustments()
+    cash_pot = st["total_rev"] + adj_total
+
+    adj_meta = f"Umsatz {fmt_money(st['total_rev'])}"
+    if adj_total:
+        sign = "+" if adj_total > 0 else "−"
+        adj_meta += f" · Anpassung {sign}{fmt_money(abs(adj_total))}"
     stats = (
         "<div class='stats'>"
         "<div class='stat'><div class='lbl'>Umsatz heute</div>"
         f"<div class='big mono'>{fmt_money(st['today_rev'])}</div>"
         f"<div class='meta'>{st['today_c']} Verkäufe · {fmt_g(st['today_g'])}</div></div>"
         "<div class='stat total'><div class='lbl'>💰 Cash Pot (gesamt)</div>"
-        f"<div class='big mono'>{fmt_money(st['total_rev'])}</div>"
-        f"<div class='meta'>{st['total_c']} Verkäufe · {fmt_g(st['total_g'])}</div></div>"
+        f"<div class='big mono'>{fmt_money(cash_pot)}</div>"
+        f"<div class='meta'>{adj_meta}</div></div>"
         "</div>"
     )
 
@@ -446,20 +527,75 @@ def dashboard(flash=""):
     else:
         day_card = ""
 
-    # ---- Pro Woche
+    # ---- Pro Woche (Montag–Sonntag)
     weeks = get_by_week()
     if weeks:
         wrows = ""
         for w in weeks:
-            lbl = f"KW {w['w']} · {w['y']}"
+            mon = w["monday"]
+            sun = mon + timedelta(days=6)
+            lbl = f"{mon.strftime('%d.%m.')}–{sun.strftime('%d.%m.')}"
             wrows += (
                 "<div class='inv'><div class='nm'>"
                 f"{html.escape(lbl)} <span class='muted' style='font-size:12px'>· {w['c']} · {fmt_g(w['g'])}</span></div>"
                 f"<div class='amt mono'>{fmt_money(w['rev'])}</div></div>"
             )
-        week_card = f"<div class='card'><h2>Pro Woche</h2>{wrows}</div>"
+        week_card = f"<div class='card'><h2>Pro Woche (Mo–So)</h2>{wrows}</div>"
     else:
         week_card = ""
+
+    # ---- Pro Monat
+    months = get_by_month()
+    mnames = ["", "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+              "August", "September", "Oktober", "November", "Dezember"]
+    if months:
+        mrows = ""
+        for m in months:
+            try:
+                y, mo = m["ym"].split("-")
+                lbl = f"{mnames[int(mo)]} {y}"
+            except (ValueError, IndexError):
+                lbl = m["ym"]
+            mrows += (
+                "<div class='inv'><div class='nm'>"
+                f"{html.escape(lbl)} <span class='muted' style='font-size:12px'>· {m['c']} · {fmt_g(m['g'])}</span></div>"
+                f"<div class='amt mono'>{fmt_money(m['rev'])}</div></div>"
+            )
+        month_card = f"<div class='card'><h2>Pro Monat</h2>{mrows}</div>"
+    else:
+        month_card = ""
+
+    # ---- Cash Pot anpassen
+    if adjustments:
+        arows = ""
+        for a in adjustments:
+            sign = "+" if a["amount"] >= 0 else "−"
+            note = html.escape(a["note"] or "—")
+            arows += (
+                "<div class='sale'><div class='l'>"
+                f"<div class='who'>{note}</div></div><div class='r'>"
+                f"<div class='pr mono'>{sign}{fmt_money(abs(a['amount']))}</div>"
+                "<form method='post' action='/adjust_delete' onsubmit=\"return confirm('Buchung entfernen?')\">"
+                f"<input type='hidden' name='id' value='{a['id']}'>"
+                "<button class='del' type='submit'>✕</button></form>"
+                "</div></div>"
+            )
+        alist = arows
+    else:
+        alist = "<div class='muted' style='padding:6px 0'>Noch keine Anpassungen.</div>"
+    cash_card = (
+        "<div class='card'><h2>💰 Cash Pot anpassen</h2>"
+        f"<div class='muted' style='font-size:13px;margin-bottom:8px'>Aktuell im Pot: "
+        f"<b class='mono' style='color:var(--gold)'>{fmt_money(cash_pot)}</b> "
+        f"(Umsatz {fmt_money(st['total_rev'])}{' · Anpassungen ' + fmt_money(adj_total) if adj_total else ''})</div>"
+        "<form method='post' action='/adjust' class='re'>"
+        "<div><label>Betrag (+ rein / − raus)</label>"
+        "<input class='mono' name='amount' inputmode='numeric' placeholder='z.B. -800'></div>"
+        "<div><label>Notiz</label><input name='note' placeholder='z.B. Einkauf' style='width:120px'></div>"
+        "<div><label>&nbsp;</label><button type='submit'>buchen</button></div>"
+        "</form>"
+        f"<div style='margin-top:10px'>{alist}</div></div>"
+    )
 
     body = (
         "<div class='top'><div><h1>🌿 Lager &amp; Umsatz</h1>"
@@ -467,7 +603,7 @@ def dashboard(flash=""):
         "<button class='tog' onclick=\"var r=document.documentElement;"
         "var d=r.getAttribute('data-theme')==='light'?'dark':'light';"
         "r.setAttribute('data-theme',d);try{localStorage.setItem('th',d)}catch(e){}\">◐</button></div>"
-        f"{warn}{flash_html}{stats}{sale_form}{inv_card}{day_card}{week_card}{sales_card}"
+        f"{warn}{flash_html}{stats}{sale_form}{inv_card}{cash_card}{day_card}{week_card}{month_card}{sales_card}"
         "<script>"
         "try{var t=localStorage.getItem('th');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}"
         f"var TIERS={tiers_js};var PRODS={prod_js};"
@@ -567,7 +703,7 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(self.path.split("?")[1]) if "?" in self.path else {}
             if q.get("ok"):
                 flash = {"sale": "Verkauf gebucht ✓", "restock": "Lager aktualisiert ✓",
-                         "del": "Verkauf gelöscht ✓"}.get(q["ok"][0], "")
+                         "del": "Verkauf gelöscht ✓", "adjust": "Cash Pot angepasst ✓"}.get(q["ok"][0], "")
             self.send_html(dashboard(flash))
         else:
             self.redirect("/")
@@ -627,6 +763,18 @@ class Handler(BaseHTTPRequestHandler):
                 sid = int(form.get("id", "0"))
                 delete_sale(sid)
                 self.redirect("/?ok=del")
+                return
+            elif path == "/adjust":
+                amount = int(float((form.get("amount") or "0").replace(",", ".")))
+                note = (form.get("note") or "").strip()[:80]
+                if amount != 0:
+                    add_adjustment(amount, note)
+                    self.redirect("/?ok=adjust")
+                    return
+            elif path == "/adjust_delete":
+                aid = int(form.get("id", "0"))
+                delete_adjustment(aid)
+                self.redirect("/?ok=adjust")
                 return
         except (ValueError, TypeError):
             pass
