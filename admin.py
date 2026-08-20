@@ -120,6 +120,35 @@ def get_sales(limit=60):
     return rows
 
 
+def get_by_day(limit=14):
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT sale_date,
+                  COALESCE(SUM(price),0) rev,
+                  COALESCE(SUM(grams),0) g,
+                  COUNT(*) c
+           FROM sales GROUP BY sale_date ORDER BY sale_date DESC LIMIT ?""",
+        (limit,),
+    )]
+    conn.close()
+    return rows
+
+
+def get_by_week(limit=8):
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        """SELECT strftime('%Y', sale_date) y,
+                  strftime('%W', sale_date) w,
+                  COALESCE(SUM(price),0) rev,
+                  COALESCE(SUM(grams),0) g,
+                  COUNT(*) c
+           FROM sales GROUP BY y, w ORDER BY y DESC, w DESC LIMIT ?""",
+        (limit,),
+    )]
+    conn.close()
+    return rows
+
+
 def add_sale(customer, pid, grams, price, sale_date):
     conn = db()
     name = PROD_BY_ID[pid][1]
@@ -255,6 +284,15 @@ details summary::-webkit-details-marker{display:none}
 .re label{margin:0 0 4px}
 .re button{padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--surface2);
   color:var(--text);font-size:14px;cursor:pointer;font-family:inherit}
+.line{border:1px solid var(--line);border-radius:12px;padding:10px;margin-bottom:8px;background:var(--surface2)}
+.linetop{display:flex;gap:8px;align-items:center}
+.linetop select{flex:1}
+.rm{flex:none;background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:9px 11px;cursor:pointer;font-size:14px}
+.rm:active{color:var(--bad);border-color:var(--bad)}
+.addline{width:100%;padding:11px;border:1px dashed var(--line);background:transparent;color:var(--muted);
+  border-radius:10px;cursor:pointer;font-family:inherit;font-size:14px;margin:2px 0 10px}
+.total{text-align:right;font-size:14px;margin:2px 0;color:var(--muted)}
+.total span{color:var(--gold);font-weight:700;font-size:19px;margin-left:6px}
 """
 
 
@@ -302,13 +340,13 @@ def dashboard(flash=""):
         "<div class='stat'><div class='lbl'>Umsatz heute</div>"
         f"<div class='big mono'>{fmt_money(st['today_rev'])}</div>"
         f"<div class='meta'>{st['today_c']} Verkäufe · {fmt_g(st['today_g'])}</div></div>"
-        "<div class='stat total'><div class='lbl'>Umsatz gesamt</div>"
+        "<div class='stat total'><div class='lbl'>💰 Cash Pot (gesamt)</div>"
         f"<div class='big mono'>{fmt_money(st['total_rev'])}</div>"
         f"<div class='meta'>{st['total_c']} Verkäufe · {fmt_g(st['total_g'])}</div></div>"
         "</div>"
     )
 
-    # ---- Verkauf buchen
+    # ---- Verkauf buchen (ein Kunde, mehrere Produktzeilen)
     opts = "".join(
         f"<option value='{pid}'>{html.escape(name)}</option>" for pid, name, _ in PRODUCTS
     )
@@ -316,22 +354,21 @@ def dashboard(flash=""):
         "'%s':[%s]" % (pid, ",".join(f"[{g},{p}]" for g, p in tiers))
         for pid, _, tiers in PRODUCTS
     ) + "}"
+    prod_js = "[" + ",".join(
+        "['%s','%s']" % (pid, name.replace("\\", "\\\\").replace("'", "\\'"))
+        for pid, name, _ in PRODUCTS
+    ) + "]"
     sale_form = (
         "<div class='card'><h2>Verkauf buchen</h2>"
         "<form method='post' action='/sale' id='saleform'>"
-        "<label>Kunde</label>"
-        "<input name='customer' placeholder='z.B. Kunde 1' autocomplete='off'>"
         "<div class='row2'>"
-        "<div><label>Produkt</label>"
-        f"<select name='product_id' id='prod'>{opts}</select></div>"
+        "<div><label>Kunde</label><input name='customer' placeholder='z.B. Kunde 1' autocomplete='off'></div>"
         f"<div><label>Datum</label><input type='date' name='sale_date' value='{today_str()}'></div>"
         "</div>"
-        "<label>Menge</label>"
-        "<div class='tiers' id='tiers'></div>"
-        "<div class='row2' style='margin-top:8px'>"
-        "<div><label>Gramm</label><input class='mono' name='grams' id='grams' inputmode='decimal' placeholder='g'></div>"
-        "<div><label>Preis</label><input class='mono' name='price' id='price' inputmode='numeric' placeholder='.-'></div>"
-        "</div>"
+        "<label>Produkte</label>"
+        "<div id='lines'></div>"
+        "<button type='button' class='addline' id='addline'>＋ weiteres Produkt</button>"
+        "<div class='total'>Summe:<span id='total'>0.-</span></div>"
         "<button class='go' type='submit'>Verkauf buchen &amp; abziehen</button>"
         "</form></div>"
     )
@@ -389,28 +426,79 @@ def dashboard(flash=""):
         rows = "<div class='muted' style='padding:8px 0'>Noch keine Verkäufe.</div>"
     sales_card = f"<div class='card'><h2>Verkäufe</h2>{rows}</div>"
 
+    # ---- Pro Tag
+    days = get_by_day()
+    wd = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    if days:
+        drows = ""
+        for d in days:
+            try:
+                dt = datetime.strptime(d["sale_date"], "%Y-%m-%d")
+                lbl = f"{wd[dt.weekday()]} {dt.strftime('%d.%m.')}"
+            except ValueError:
+                lbl = d["sale_date"]
+            drows += (
+                "<div class='inv'><div class='nm'>"
+                f"{html.escape(lbl)} <span class='muted' style='font-size:12px'>· {d['c']} · {fmt_g(d['g'])}</span></div>"
+                f"<div class='amt mono'>{fmt_money(d['rev'])}</div></div>"
+            )
+        day_card = f"<div class='card'><h2>Pro Tag</h2>{drows}</div>"
+    else:
+        day_card = ""
+
+    # ---- Pro Woche
+    weeks = get_by_week()
+    if weeks:
+        wrows = ""
+        for w in weeks:
+            lbl = f"KW {w['w']} · {w['y']}"
+            wrows += (
+                "<div class='inv'><div class='nm'>"
+                f"{html.escape(lbl)} <span class='muted' style='font-size:12px'>· {w['c']} · {fmt_g(w['g'])}</span></div>"
+                f"<div class='amt mono'>{fmt_money(w['rev'])}</div></div>"
+            )
+        week_card = f"<div class='card'><h2>Pro Woche</h2>{wrows}</div>"
+    else:
+        week_card = ""
+
     body = (
         "<div class='top'><div><h1>🌿 Lager &amp; Umsatz</h1>"
         f"<div class='sub'>Stand {html.escape(today_str())}</div></div>"
         "<button class='tog' onclick=\"var r=document.documentElement;"
         "var d=r.getAttribute('data-theme')==='light'?'dark':'light';"
         "r.setAttribute('data-theme',d);try{localStorage.setItem('th',d)}catch(e){}\">◐</button></div>"
-        f"{warn}{flash_html}{stats}{sale_form}{inv_card}{sales_card}"
+        f"{warn}{flash_html}{stats}{sale_form}{inv_card}{day_card}{week_card}{sales_card}"
         "<script>"
         "try{var t=localStorage.getItem('th');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}"
-        f"var TIERS={tiers_js};"
-        "var prod=document.getElementById('prod'),tiersEl=document.getElementById('tiers'),"
-        "gramsEl=document.getElementById('grams'),priceEl=document.getElementById('price');"
-        "function renderTiers(){tiersEl.innerHTML='';var arr=TIERS[prod.value]||[];"
-        "arr.forEach(function(t){var b=document.createElement('button');b.type='button';b.className='tier';"
-        "b.innerHTML=t[0]+'g<small>'+t[1]+'.-</small>';"
-        "b.onclick=function(){gramsEl.value=t[0];priceEl.value=t[1];"
-        "[].forEach.call(tiersEl.children,function(c){c.classList.remove('on')});b.classList.add('on');};"
-        "tiersEl.appendChild(b);});}"
-        "prod.addEventListener('change',function(){gramsEl.value='';priceEl.value='';renderTiers();});"
-        "renderTiers();"
+        f"var TIERS={tiers_js};var PRODS={prod_js};"
+        "var linesEl=document.getElementById('lines'),totalEl=document.getElementById('total');"
+        "function optsHtml(){return PRODS.map(function(p){return \"<option value='\"+p[0]+\"'>\"+p[1]+\"</option>\";}).join('');}"
+        "function recalc(){var t=0;linesEl.querySelectorAll('.lp').forEach(function(i){var v=parseFloat(i.value);if(!isNaN(v))t+=v;});"
+        "totalEl.textContent=(t?t.toLocaleString('de-CH').replace(/,/g,\"'\"):'0')+'.-';}"
+        "function renderTiers(line){var box=line.querySelector('.tiers'),sel=line.querySelector('.lprod');"
+        "box.innerHTML='';(TIERS[sel.value]||[]).forEach(function(t){var b=document.createElement('button');"
+        "b.type='button';b.className='tier';b.innerHTML=t[0]+'g<small>'+t[1]+'.-</small>';"
+        "b.onclick=function(){line.querySelector('.lg').value=t[0];line.querySelector('.lp').value=t[1];"
+        "box.querySelectorAll('.tier').forEach(function(c){c.classList.remove('on');});b.classList.add('on');recalc();};"
+        "box.appendChild(b);});}"
+        "function makeLine(){var d=document.createElement('div');d.className='line';"
+        "d.innerHTML=\"<div class='linetop'><select class='lprod' name='line_product'>\"+optsHtml()+\"</select>\"+"
+        "\"<button type='button' class='rm' title='Zeile entfernen'>✕</button></div>\"+"
+        "\"<div class='tiers'></div><div class='row2' style='margin-top:8px'>\"+"
+        "\"<input class='mono lg' name='line_grams' inputmode='decimal' placeholder='Gramm'>\"+"
+        "\"<input class='mono lp' name='line_price' inputmode='numeric' placeholder='Preis .-'></div>\";"
+        "d.querySelector('.lprod').addEventListener('change',function(){d.querySelector('.lg').value='';"
+        "d.querySelector('.lp').value='';renderTiers(d);recalc();});"
+        "d.querySelector('.lp').addEventListener('input',recalc);"
+        "d.querySelector('.rm').addEventListener('click',function(){"
+        "if(linesEl.children.length>1){d.remove();recalc();}else{alert('Mindestens eine Zeile.');}});"
+        "linesEl.appendChild(d);renderTiers(d);}"
+        "document.getElementById('addline').addEventListener('click',makeLine);"
+        "makeLine();"
         "document.getElementById('saleform').addEventListener('submit',function(e){"
-        "if(!gramsEl.value||!priceEl.value){e.preventDefault();alert('Bitte Menge wählen oder Gramm/Preis eintragen.');}});"
+        "var ok=false;linesEl.querySelectorAll('.line').forEach(function(l){"
+        "if(parseFloat(l.querySelector('.lg').value)>0&&parseFloat(l.querySelector('.lp').value)>=0)ok=true;});"
+        "if(!ok){e.preventDefault();alert('Bitte mindestens ein Produkt mit Menge und Preis eintragen.');}});"
         "</script>"
     )
     return shell("Lager & Umsatz", body)
@@ -458,6 +546,13 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
 
+    def read_form_multi(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        multi = parse_qs(raw, keep_blank_values=True)
+        single = {k: v[0] for k, v in multi.items()}
+        return single, multi
+
     # -- routing
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -496,18 +591,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(login_page())
             return
 
-        form = self.read_form()
+        form, multi = self.read_form_multi()
         try:
             if path == "/sale":
-                pid = form.get("product_id", "")
-                grams = float((form.get("grams") or "0").replace(",", "."))
-                price = int(float((form.get("price") or "0").replace(",", ".")))
                 cust = (form.get("customer") or "").strip()[:60]
                 sdate = form.get("sale_date") or today_str()
                 if not re.match(r"^\d{4}-\d{2}-\d{2}$", sdate):
                     sdate = today_str()
-                if pid in PROD_BY_ID and grams > 0 and price >= 0:
-                    add_sale(cust, pid, grams, price, sdate)
+                prods = multi.get("line_product", [])
+                gramss = multi.get("line_grams", [])
+                prices = multi.get("line_price", [])
+                booked = 0
+                for i in range(min(len(prods), len(gramss), len(prices))):
+                    pid = prods[i]
+                    try:
+                        grams = float((gramss[i] or "0").replace(",", "."))
+                        price = int(float((prices[i] or "0").replace(",", ".")))
+                    except (ValueError, TypeError):
+                        continue
+                    if pid in PROD_BY_ID and grams > 0 and price >= 0:
+                        add_sale(cust, pid, grams, price, sdate)
+                        booked += 1
+                if booked:
                     self.redirect("/?ok=sale")
                     return
             elif path == "/restock":
