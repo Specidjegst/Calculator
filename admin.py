@@ -154,18 +154,39 @@ def get_by_day(limit=14):
     return rows
 
 
-def get_by_month(limit=6):
+def get_month_tree(limit=6):
+    """Baum: Monat -> Wochen (Mo-So) -> Tage, jeweils mit Summen."""
     conn = db()
-    rows = [dict(r) for r in conn.execute(
-        """SELECT strftime('%Y-%m', sale_date) ym,
+    days = [dict(r) for r in conn.execute(
+        """SELECT sale_date,
                   COALESCE(SUM(price),0) rev,
                   COALESCE(SUM(grams),0) g,
                   COUNT(*) c
-           FROM sales GROUP BY ym ORDER BY ym DESC LIMIT ?""",
-        (limit,),
+           FROM sales GROUP BY sale_date"""
     )]
     conn.close()
-    return rows
+    months = {}
+    for d in days:
+        try:
+            dt = datetime.strptime(d["sale_date"], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        mkey = dt.strftime("%Y-%m")
+        m = months.setdefault(mkey, {"ym": mkey, "rev": 0, "g": 0, "c": 0, "weeks": {}})
+        m["rev"] += d["rev"]; m["g"] += d["g"]; m["c"] += d["c"]
+        monday = dt - timedelta(days=dt.weekday())
+        w = m["weeks"].setdefault(monday, {"monday": monday, "rev": 0, "g": 0, "c": 0, "days": []})
+        w["rev"] += d["rev"]; w["g"] += d["g"]; w["c"] += d["c"]
+        w["days"].append({"date": dt, "rev": d["rev"], "g": d["g"], "c": d["c"]})
+    out = []
+    for mkey in sorted(months, reverse=True)[:limit]:
+        m = months[mkey]
+        weeks = [m["weeks"][k] for k in sorted(m["weeks"], reverse=True)]
+        for w in weeks:
+            w["days"].sort(key=lambda x: x["date"], reverse=True)
+        m["weeks_sorted"] = weeks
+        out.append(m)
+    return out
 
 
 def get_adjustments():
@@ -215,11 +236,14 @@ def get_by_week(limit=8):
         except ValueError:
             continue
         monday = dt - timedelta(days=dt.weekday())
-        a = acc.setdefault(monday, {"monday": monday, "rev": 0, "g": 0, "c": 0})
+        a = acc.setdefault(monday, {"monday": monday, "rev": 0, "g": 0, "c": 0, "days": []})
         a["rev"] += d["rev"]
         a["g"] += d["g"]
         a["c"] += d["c"]
+        a["days"].append({"date": dt, "rev": d["rev"], "g": d["g"], "c": d["c"]})
     weeks = sorted(acc.values(), key=lambda x: x["monday"], reverse=True)[:limit]
+    for w in weeks:
+        w["days"].sort(key=lambda x: x["date"], reverse=True)
     return weeks
 
 
@@ -272,6 +296,30 @@ def fmt_g(n):
     n = float(n)
     s = f"{n:.0f}" if abs(n - round(n)) < 1e-9 else f"{n:.1f}"
     return s + "g"
+
+
+WD = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+MNAMES = ["", "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+          "August", "September", "Oktober", "November", "Dezember"]
+
+
+def _day_row(d):
+    lbl = f"{WD[d['date'].weekday()]} {d['date'].strftime('%d.%m.')}"
+    return ("<div class='dd'><div class='nm'>"
+            f"{lbl} · {d['c']} · {fmt_g(d['g'])}</div>"
+            f"<div class='mono'>{fmt_money(d['rev'])}</div></div>")
+
+
+def _week_details(w, cls="wk"):
+    mon = w["monday"]
+    sun = mon + timedelta(days=6)
+    lbl = f"{mon.strftime('%d.%m.')}–{sun.strftime('%d.%m.')}"
+    days_html = "".join(_day_row(d) for d in w["days"])
+    return (f"<details class='exp {cls}'><summary>"
+            "<span class='nm'><span class='caret'>▶</span>"
+            f"{lbl} <span class='muted' style='font-size:12px;margin-left:4px'>· {w['c']} · {fmt_g(w['g'])}</span></span>"
+            f"<span class='amt mono'>{fmt_money(w['rev'])}</span></summary>"
+            f"<div class='sub-rows'>{days_html}</div></details>")
 
 
 CSS = """
@@ -367,6 +415,19 @@ details summary::-webkit-details-marker{display:none}
   border-radius:10px;cursor:pointer;font-family:inherit;font-size:14px;margin:2px 0 10px}
 .total{text-align:right;font-size:14px;margin:2px 0;color:var(--muted)}
 .total span{color:var(--gold);font-weight:700;font-size:19px;margin-left:6px}
+details.exp{border-bottom:1px solid var(--line)}
+details.exp:last-child{border-bottom:0}
+details.exp>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:11px 0;cursor:pointer;list-style:none}
+details.exp>summary::-webkit-details-marker{display:none}
+details.exp>summary .nm{display:flex;align-items:center}
+.caret{display:inline-block;color:var(--muted);font-size:10px;margin-right:8px;transition:transform .15s}
+details.exp[open]>summary .caret{transform:rotate(90deg)}
+.sub-rows{padding:0 0 8px 18px}
+.dd{display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px dashed var(--line);font-size:13px}
+.dd .nm{color:var(--muted)}
+.mo-weeks{padding-left:14px}
+details.exp.wk2>summary{padding:8px 0}
 """
 
 
@@ -527,41 +588,36 @@ def dashboard(flash=""):
     else:
         day_card = ""
 
-    # ---- Pro Woche (Montag–Sonntag)
+    # ---- Pro Woche (aufklappbar -> Tage)
     weeks = get_by_week()
     if weeks:
-        wrows = ""
-        for w in weeks:
-            mon = w["monday"]
-            sun = mon + timedelta(days=6)
-            lbl = f"{mon.strftime('%d.%m.')}–{sun.strftime('%d.%m.')}"
-            wrows += (
-                "<div class='inv'><div class='nm'>"
-                f"{html.escape(lbl)} <span class='muted' style='font-size:12px'>· {w['c']} · {fmt_g(w['g'])}</span></div>"
-                f"<div class='amt mono'>{fmt_money(w['rev'])}</div></div>"
-            )
-        week_card = f"<div class='card'><h2>Pro Woche (Mo–So)</h2>{wrows}</div>"
+        week_card = (
+            "<div class='card'><h2>Pro Woche (Mo–So) · tippen für Tage</h2>"
+            + "".join(_week_details(w) for w in weeks)
+            + "</div>"
+        )
     else:
         week_card = ""
 
-    # ---- Pro Monat
-    months = get_by_month()
-    mnames = ["", "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
-              "August", "September", "Oktober", "November", "Dezember"]
-    if months:
-        mrows = ""
-        for m in months:
+    # ---- Pro Monat (aufklappbar -> Wochen -> Tage)
+    tree = get_month_tree()
+    if tree:
+        blocks = ""
+        for m in tree:
             try:
                 y, mo = m["ym"].split("-")
-                lbl = f"{mnames[int(mo)]} {y}"
+                mlbl = f"{MNAMES[int(mo)]} {y}"
             except (ValueError, IndexError):
-                lbl = m["ym"]
-            mrows += (
-                "<div class='inv'><div class='nm'>"
-                f"{html.escape(lbl)} <span class='muted' style='font-size:12px'>· {m['c']} · {fmt_g(m['g'])}</span></div>"
-                f"<div class='amt mono'>{fmt_money(m['rev'])}</div></div>"
+                mlbl = m["ym"]
+            weeks_html = "".join(_week_details(w, cls="wk2") for w in m["weeks_sorted"])
+            blocks += (
+                "<details class='exp'><summary>"
+                "<span class='nm'><span class='caret'>▶</span>"
+                f"{html.escape(mlbl)} <span class='muted' style='font-size:12px;margin-left:4px'>· {m['c']} · {fmt_g(m['g'])}</span></span>"
+                f"<span class='amt mono'>{fmt_money(m['rev'])}</span></summary>"
+                f"<div class='mo-weeks'>{weeks_html}</div></details>"
             )
-        month_card = f"<div class='card'><h2>Pro Monat</h2>{mrows}</div>"
+        month_card = f"<div class='card'><h2>Pro Monat › Woche › Tag · tippen</h2>{blocks}</div>"
     else:
         month_card = ""
 
