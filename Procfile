@@ -1,0 +1,1 @@
+web: python admin.py

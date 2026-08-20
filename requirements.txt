@@ -1,0 +1,2 @@
+# Keine externen Pakete noetig – nur die Python-Standardbibliothek.
+# Diese Datei sorgt nur dafuer, dass Railway/Nixpacks das Projekt als Python erkennt.
